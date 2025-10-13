@@ -4,10 +4,11 @@
   "description": "capsulization agent for ant",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "nodemon src/index.js",
-    "seed": "node src/seed.js"
-  },
+  "dev": "nodemon src/index.js",
+  "seed": "node src/seed.js",
+  "worker": "node src/worker.js",
+  "dev:seed": "concurrently -n \"WORKER,SEED\" -c \"cyan,yellow\" \"node src/worker.js\" \"bash -c 'sleep 3 && node src/seed.js'\""
+},
   "keywords": [],
   "author": "Steve Rouse",
   "license": "MIT",
@@ -24,6 +25,7 @@
     "playwright": "^1.56.0"
   },
   "devDependencies": {
+    "concurrently": "^9.2.1",
     "nodemon": "^3.1.10"
   }
 }

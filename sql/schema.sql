@@ -1,6 +1,6 @@
 -- ===========================================
 -- ANT-CAPSULIZER DATABASE SCHEMA (MySQL 8.x)
--- Safe for repeated runs
+-- Fully idempotent: safe to re-run
 -- ===========================================
 
 -- Drop trigger if it already exists
@@ -16,7 +16,9 @@ CREATE TABLE IF NOT EXISTS nodes (
   domain VARCHAR(255)
     GENERATED ALWAYS AS (SUBSTRING_INDEX(SUBSTRING_INDEX(source_url, '/', 3), '//', -1)) STORED,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  last_harvested DATETIME NULL
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  last_harvested DATETIME NULL,
+  last_inferred_at DATETIME NULL
 );
 
 CREATE TABLE IF NOT EXISTS capsules (
@@ -25,16 +27,47 @@ CREATE TABLE IF NOT EXISTS capsules (
   capsule_json JSON NOT NULL,
   fingerprint VARCHAR(80) NOT NULL,
   harvested_at DATETIME NOT NULL,
+  inferred_at DATETIME NULL,
   status ENUM('ok','needs_review','error') DEFAULT 'ok',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
 );
 
 -- ----------------------------
--- Drop and recreate indexes (no IF logic)
+-- Indexes (drop safely before re-create)
 -- ----------------------------
--- Drop existing indexes if they exist; ignore error if not.
-DROP INDEX idx_capsules_fp ON capsules;
-DROP INDEX idx_nodes_domain ON nodes;
+-- Capsules fingerprint index
+SET @has_idx_capsules_fp := (
+  SELECT COUNT(*)
+  FROM information_schema.statistics
+  WHERE table_schema = DATABASE()
+    AND table_name = 'capsules'
+    AND index_name = 'idx_capsules_fp'
+);
+SET @sql := IF(@has_idx_capsules_fp > 0,
+  'DROP INDEX idx_capsules_fp ON capsules;',
+  'SELECT "skip";'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+-- Nodes domain index
+SET @has_idx_nodes_domain := (
+  SELECT COUNT(*)
+  FROM information_schema.statistics
+  WHERE table_schema = DATABASE()
+    AND table_name = 'nodes'
+    AND index_name = 'idx_nodes_domain'
+);
+SET @sql := IF(@has_idx_nodes_domain > 0,
+  'DROP INDEX idx_nodes_domain ON nodes;',
+  'SELECT "skip";'
+);
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 -- Recreate indexes
 CREATE INDEX idx_capsules_fp ON capsules(fingerprint);

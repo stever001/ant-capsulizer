@@ -1,34 +1,21 @@
 // src/queue.js
-const { Queue, QueueEvents } = require('bullmq');
-const IORedis = require('ioredis');
+require("dotenv").config();
+const { Queue } = require("bullmq");
+const Redis = require("ioredis");
 
-// Redis connection
-const connection = new IORedis({
-  host: process.env.REDIS_HOST,
-  port: Number(process.env.REDIS_PORT),
+const REDIS_PORT = parseInt(process.env.REDIS_PORT, 10) || 6379;
+const REDIS_HOST = process.env.REDIS_HOST || "127.0.0.1";
 
-  // BullMQ compatibility settings
-  maxRetriesPerRequest: null,
-  enableReadyCheck: false,
+const connection = new Redis({
+  host: REDIS_HOST,
+  port: REDIS_PORT,
+  maxRetriesPerRequest: null, // ✅ required for BullMQ v5
+  enableReadyCheck: false,    // ✅ recommended with BullMQ v5
 });
 
-const queueName = 'capsuleQueue';
-const q = new Queue(queueName, { connection });
+const queueName = "capsuleQueue";
+const queue = new Queue(queueName, { connection });
 
-// Optional: event hooks
-const queueEvents = new QueueEvents(queueName, { connection });
-queueEvents.on('completed', ({ jobId }) => {
-  console.log(`✅ Job ${jobId} completed`);
-});
-queueEvents.on('failed', ({ jobId, failedReason }) => {
-  console.error(`❌ Job ${jobId} failed: ${failedReason}`);
-});
+console.log("🧩 Queue initialized:", queueName);
 
-console.log(`🧩 Queue initialized: ${queueName}`);
-
-module.exports = {
-  connection,
-  queueName,
-  q,
-  queueEvents,
-};
+module.exports = { connection, queueName, queue };
