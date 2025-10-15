@@ -5,6 +5,9 @@
   "main": "index.js",
   "scripts": {
   "dev": "nodemon src/index.js",
+  "report": "node src/tools/logReport.js",
+  "requeue": "node src/tools/requeueFailedJobs.js",
+  "schedule": "node src/tools/scheduleUpdates.js",
   "seed": "node src/seed.js",
   "worker": "node src/worker.js",
   "dev:seed": "concurrently -n \"WORKER,SEED\" -c \"cyan,yellow\" \"node src/worker.js\" \"bash -c 'sleep 3 && node src/seed.js'\""

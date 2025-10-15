@@ -5,10 +5,12 @@ const { Worker } = require("bullmq");
 const { chromium } = require("playwright");
 const fs = require("fs-extra");
 const cheerio = require("cheerio");
+const { checkProtocol } = require("./utils/checkProtocol");
 const { connection, queueName } = require("./queue");
-const { upsertNode, insertCapsule } = require("./db");
+const { upsertNode, insertCapsule, pool } = require("./db"); // ✅ pool added
 const { fp } = require("./normalize");
-const { inferCapsule } = require("./inferencer"); // ✅ new import for inference
+const { inferCapsule } = require("./inferencer");
+const { classifyNodeType } = require("./utils/classifyNodeType"); // ✅ new import
 
 const CONCURRENCY = parseInt(process.env.CONCURRENCY || 4);
 const UA = process.env.USER_AGENT || "AgentNet-Capsulizer/1.0";
@@ -97,6 +99,8 @@ async function crawlSite(baseUrl, ctx, owner_slug, nodeId) {
     start: new Date().toISOString(),
   };
 
+  const allCapsules = []; // ✅ track all for node classification
+
   while (queue.length && visited.size < MAX_PAGES_PER_SITE) {
     const { url, depth } = queue.shift();
     if (visited.has(url) || depth > MAX_DEPTH) continue;
@@ -110,14 +114,13 @@ async function crawlSite(baseUrl, ctx, owner_slug, nodeId) {
       const html = await page.content();
       const text = await page.evaluate(() => document.body.innerText || "");
 
-      // --- Step 1: Extract explicit JSON-LD metadata
       const capsules = extractCapsules(html, url);
       const harvested_at = new Date().toISOString();
 
-      // --- Step 2: Inference + enrichment for each capsule
       for (const capsule of capsules) {
         try {
-          const extractedCapsule = capsule.agentnet?.content || capsule["agentnet:content"];
+          const extractedCapsule =
+            capsule.agentnet?.content || capsule["agentnet:content"];
           const { capsule: enrichedCapsule, inferred } = await inferCapsule({
             url,
             html,
@@ -126,9 +129,12 @@ async function crawlSite(baseUrl, ctx, owner_slug, nodeId) {
             options: { enableLLM: true },
           });
 
-          // --- Step 3: Save to DB
           const fingerprint = fp(enrichedCapsule);
           await insertCapsule(nodeId, enrichedCapsule, fingerprint, harvested_at, "ok");
+
+          allCapsules.push({
+            "agentnet:content": enrichedCapsule,
+          });
 
           if (inferred && Object.keys(inferred).length) {
             siteStats.inferred += 1;
@@ -139,7 +145,6 @@ async function crawlSite(baseUrl, ctx, owner_slug, nodeId) {
         }
       }
 
-      // --- Save snapshot locally
       await fs.ensureDir("./snapshots");
       await fs.writeFile(`./snapshots/${encodeURIComponent(url)}.html`, html);
 
@@ -147,7 +152,6 @@ async function crawlSite(baseUrl, ctx, owner_slug, nodeId) {
       siteStats.pages += 1;
       siteStats.capsules += capsules.length;
 
-      // --- Step 4: Enqueue internal links for shallow recursion
       if (depth < MAX_DEPTH) {
         const links = await page.$$eval("a[href]", (as) =>
           as.map((a) => a.href).filter((h) => h && h.startsWith(location.origin))
@@ -162,6 +166,18 @@ async function crawlSite(baseUrl, ctx, owner_slug, nodeId) {
     } finally {
       await page.close();
     }
+  }
+
+  // ✅ Classify node type after crawl
+  try {
+    const category = classifyNodeType(allCapsules);
+    await pool.query(`UPDATE nodes SET node_category=? WHERE id=?`, [
+      category,
+      nodeId,
+    ]);
+    console.log(`🏷️  Node ${origin} classified as '${category}'`);
+  } catch (err) {
+    console.warn(`⚠️ Node classification failed for ${origin}: ${err.message}`);
   }
 
   siteStats.end = new Date().toISOString();
