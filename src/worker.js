@@ -7,6 +7,9 @@ const fs = require("fs-extra");
 const crypto = require("crypto");
 const path = require("path");
 
+const Ajv = require("ajv");
+const addFormats = require("ajv-formats");
+
 const { checkProtocol } = require("./utils/checkProtocol");
 const { connection, queueName } = require("./queue");
 const { upsertNode, insertCapsule, pool } = require("./db");
@@ -17,8 +20,11 @@ const { classifyNodeType } = require("./utils/classifyNodeType");
 // ✅ JSON-LD extractor (must export { extractJsonLd })
 const { extractJsonLd } = require("./extractor/jsonld");
 
+// ------------------------------
+// Config
+// ------------------------------
 const CONCURRENCY = parseInt(process.env.CONCURRENCY || 4, 10);
-const UA = process.env.USER_AGENT || "AgentNet-Capsulizer/1.0";
+const UA = process.env.USER_AGENT || "AgentNet-Capsulizer/1.0 (+https://agentnet.ai)";
 const PER_HOST_DELAY = parseInt(process.env.PER_HOST_DELAY_MS || 500, 10);
 const MAX_DEPTH = parseInt(process.env.MAX_DEPTH || 10, 10);
 const MAX_PAGES_PER_SITE = parseInt(process.env.MAX_PAGES_PER_SITE || 10, 10);
@@ -29,16 +35,72 @@ const RUNS_DIR = "./runs";
 
 // Optional flags (safe defaults)
 const ENABLE_LLM = (process.env.ENABLE_LLM ?? "true").toLowerCase() === "true";
-const WRITE_SNAPSHOTS =
-  (process.env.WRITE_SNAPSHOTS ?? "true").toLowerCase() === "true";
+const WRITE_SNAPSHOTS = (process.env.WRITE_SNAPSHOTS ?? "true").toLowerCase() === "true";
 
-// ✅ Demo-friendly flag
-// Guardrail: default FALSE so prod isn't silently single-page
-const SINGLE_PAGE =
-  (process.env.SINGLE_PAGE ?? "false").toLowerCase() === "true";
+// Demo-friendly flag: default to single-page mode
+const SINGLE_PAGE = (process.env.SINGLE_PAGE ?? "true").toLowerCase() === "true";
 
-// ✅ CG version marker
-const CG_VERSION = process.env.CG_VERSION || "cg-0.3-run-manifest";
+// Deterministic mode (reproducible fingerprints)
+const CG_DETERMINISTIC = (process.env.CG_DETERMINISTIC ?? "false").toLowerCase() === "true";
+
+// CG version marker
+const CG_VERSION = process.env.CG_VERSION || "cg-0.5-determinism-ajv-output";
+
+// Envelope schema validation gate
+const VALIDATE_ENVELOPE = (process.env.VALIDATE_ENVELOPE ?? "true").toLowerCase() === "true";
+
+// Determinism: disable LLM
+const EFFECTIVE_ENABLE_LLM = CG_DETERMINISTIC ? false : ENABLE_LLM;
+
+// ------------------------------
+// AJV schema validator (SYNC init - CommonJS safe)
+// ------------------------------
+let validateEnvelope = null;
+let envelopeSchemaLoaded = false;
+
+if (VALIDATE_ENVELOPE) {
+  try {
+    const schemaPath = path.resolve(__dirname, "../schemas/cg-envelope.schema.json");
+    const exists = fs.existsSync(schemaPath);
+
+    if (!exists) {
+      console.warn(
+        `⚠️  VALIDATE_ENVELOPE=true but schema file not found at ${schemaPath}. Validation disabled.`
+      );
+    } else {
+      const raw = fs.readFileSync(schemaPath, "utf8");
+      if (!raw || !raw.trim()) {
+        console.warn(
+          `⚠️  VALIDATE_ENVELOPE=true but schema file is empty at ${schemaPath}. Validation disabled.`
+        );
+      } else {
+        const schemaJson = JSON.parse(raw);
+
+        const ajv = new Ajv({
+          allErrors: true,
+          strict: false,
+          allowUnionTypes: true,
+          // If you want formats to be *enforced*, keep addFormats(ajv) + install ajv-formats.
+          // If not installed, we catch below.
+        });
+
+        try {
+          addFormats(ajv);
+        } catch (fmtErr) {
+          // Still compile fine; formats will just be ignored.
+          console.warn(`⚠️  ajv-formats not available (formats ignored): ${fmtErr.message}`);
+        }
+
+        validateEnvelope = ajv.compile(schemaJson);
+        envelopeSchemaLoaded = true;
+        console.log(`✅ Envelope schema loaded: ${schemaPath}`);
+      }
+    }
+  } catch (e) {
+    console.warn(`⚠️  Failed to initialize AJV validator. Validation disabled. ${e.message}`);
+    validateEnvelope = null;
+  }
+}
 
 // ------------------------------
 // Polite throttle per host
@@ -70,14 +132,10 @@ function normalizeUrl(raw) {
 
   const dropPrefixes = ["utm_", "gclid", "fbclid", "msclkid", "a_ajs_"];
   for (const key of [...u.searchParams.keys()]) {
-    if (
-      dropPrefixes.some((p) => key === p || key.startsWith(p)) ||
-      key.startsWith("a_ajs_")
-    ) {
+    if (dropPrefixes.some((p) => key === p || key.startsWith(p)) || key.startsWith("a_ajs_")) {
       u.searchParams.delete(key);
     }
   }
-
   return u.toString();
 }
 
@@ -87,42 +145,122 @@ function normalizeUrl(raw) {
 function snapshotName(url) {
   const u = new URL(url);
   const base = `${u.host}${u.pathname}`.replace(/[^a-zA-Z0-9/_-]/g, "_");
-  const hash = crypto
-    .createHash("sha256")
-    .update(url)
-    .digest("hex")
-    .slice(0, 16);
+  const hash = crypto.createHash("sha256").update(url).digest("hex").slice(0, 16);
   const safeBase = base.replace(/\//g, "_").slice(0, 120);
   return `${safeBase}__${hash}.html`;
 }
 
 // ------------------------------
-// Run ID + manifest utilities
+// Run ID
 // ------------------------------
 function makeRunId() {
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
-  const rand = crypto.randomBytes(6).toString("hex");
-  return `run_${ts}__${rand}`;
-}
-
-function runManifestPathFor(runId) {
-  return path.join(RUNS_DIR, `${runId}.json`);
-}
-
-async function writeRunManifestAt(filePath, manifest) {
-  await fs.ensureDir(RUNS_DIR);
-  await fs.writeJson(filePath, manifest, { spaces: 2 });
-  return filePath;
+  const nonce = crypto.randomBytes(16).toString("hex").slice(0, 12);
+  return `run_${ts}__${nonce}`;
 }
 
 // ------------------------------
-// Build Capsule envelope
+// Deterministic helpers
+// ------------------------------
+function stableSortJsonLd(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map(stableSortJsonLd)
+      .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+  }
+  if (value && typeof value === "object") {
+    return Object.keys(value)
+      .sort()
+      .reduce((acc, k) => {
+        acc[k] = stableSortJsonLd(value[k]);
+        return acc;
+      }, {});
+  }
+  return value;
+}
+
+function selectPrimaryIndexDeterministic(blocks) {
+  // blocks: [{ json, provenance }, ...]
+  if (!Array.isArray(blocks) || blocks.length === 0) return { index: null, type: null };
+
+  const scored = blocks.map((b, i) => ({
+    i,
+    s: JSON.stringify(b?.json ?? {}),
+    t: b?.json ? b.json["@type"] : null,
+  }));
+
+  scored.sort((a, b) => a.s.localeCompare(b.s));
+  const pick = scored[0];
+
+  const type = Array.isArray(pick.t) ? pick.t[0] : pick.t;
+  const cleanedType = typeof type === "string" ? type.replace(/^schema:/, "") : type;
+
+  return { index: pick.i, type: cleanedType || null };
+}
+
+function stableFingerprintView(envelope) {
+  const e = JSON.parse(JSON.stringify(envelope || {}));
+
+  // Volatile envelope fields
+  delete e["agentnet:captureDate"];
+  delete e["agentnet:cgRunId"];
+  delete e["agentnet:cgManifestPath"]; // varies per run
+
+  // Volatile provenance timestamps
+  const prov = e?.["agentnet:asserted"]?.provenance;
+  if (prov && typeof prov === "object") {
+    delete prov.capturedAt;
+  }
+
+  // Canonicalize asserted array/object
+  const asserted = e?.["agentnet:asserted"]?.json;
+  if (Array.isArray(asserted)) {
+    const keyed = asserted.map((obj) => stableSortJsonLd(obj));
+    keyed.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+    e["agentnet:asserted"].json = keyed;
+  } else if (asserted && typeof asserted === "object") {
+    e["agentnet:asserted"].json = stableSortJsonLd(asserted);
+  }
+
+  // Canonicalize content (helps reduce fingerprint jitter)
+  if (e["agentnet:content"] && typeof e["agentnet:content"] === "object") {
+    e["agentnet:content"] = stableSortJsonLd(e["agentnet:content"]);
+  }
+
+  return e;
+}
+
+// ------------------------------
+// Required tiny price guardrail
+// ------------------------------
+function guardTinyPrice(content, report) {
+  const p = content?.["agentnet:price"];
+  if (p == null) return;
+
+  const n = typeof p === "string" ? Number(p) : Number(p);
+  if (!Number.isFinite(n)) return;
+
+  if (n > 0 && n < 5) {
+    delete content["agentnet:price"];
+    report.priceGuardrail = {
+      dropped: true,
+      reason: "tiny_price",
+      threshold: 5,
+      observed: n,
+    };
+  }
+}
+
+// ------------------------------
+// Build envelope
 // ------------------------------
 function buildEnvelope({
   url,
   harvestedAt,
-  assertedJsonLdArray, // array | null
-  assertedProvenanceArray, // array | null
+  cgRunId,
+  manifestPath,
+  assertedJsonLd, // array|object|null
+  assertedProvenance,
   jsonldRawScriptCount,
   jsonldParseErrors,
   enrichedContent,
@@ -130,93 +268,69 @@ function buildEnvelope({
   structuredMarkup,
   assertedPrimaryIndex,
   assertedPrimaryType,
-  runId,
 }) {
   return {
     "@context": "https://agentnet.ai/context",
     "@type": "agentnet:Capsule",
 
     "agentnet:cgVersion": CG_VERSION,
-    "agentnet:cgRunId": runId,
+    "agentnet:cgRunId": cgRunId,
+    ...(manifestPath ? { "agentnet:cgManifestPath": manifestPath } : {}),
 
     "agentnet:source": url,
     "agentnet:captureDate": harvestedAt,
 
-    // ✅ Asserted is an ARRAY of JSON-LD objects when present
-    "agentnet:asserted": assertedJsonLdArray?.length
-      ? {
-          json: assertedJsonLdArray,
-          provenance: assertedProvenanceArray?.length
-            ? assertedProvenanceArray
-            : null,
-        }
+    "agentnet:asserted": assertedJsonLd
+      ? { json: assertedJsonLd, provenance: assertedProvenance || null }
       : null,
 
     "agentnet:content": enrichedContent || {},
 
-    ...(inferredMeta && Object.keys(inferredMeta).length
-      ? { "agentnet:inferred": inferredMeta }
-      : {}),
+    ...(inferredMeta && Object.keys(inferredMeta).length ? { "agentnet:inferred": inferredMeta } : {}),
 
     "agentnet:report": {
       structuredMarkup,
       jsonldRawScriptCount: jsonldRawScriptCount || 0,
       jsonldParseErrors: jsonldParseErrors || 0,
       singlePageMode: SINGLE_PAGE,
-      assertedMode: "array-per-page",
-      assertedPrimaryIndex,
-      assertedPrimaryType,
+
+      assertedPrimaryIndex: assertedPrimaryIndex ?? null,
+      assertedPrimaryType: assertedPrimaryType ?? null,
+
+      deterministic: CG_DETERMINISTIC,
+      llmEnabled: EFFECTIVE_ENABLE_LLM,
+
+      // if validation fails, we add schemaErrors here
     },
   };
 }
 
 // ------------------------------
-// Choose best asserted object for inferencer seed + record index/type
+// Crawl
 // ------------------------------
-function pickBestAssertedWithIndex(assertedArray) {
-  if (!Array.isArray(assertedArray) || !assertedArray.length) {
-    return { primary: {}, primaryIndex: null, primaryType: null };
-  }
-
-  const isProduct = (o) => {
-    const t = o?.["@type"];
-    if (Array.isArray(t)) return t.some((x) => String(x).includes("Product"));
-    return String(t || "").includes("Product");
-  };
-
-  const idx = assertedArray.findIndex(isProduct);
-  const primaryIndex = idx >= 0 ? idx : 0;
-  const primary = assertedArray[primaryIndex] || {};
-  const primaryType = primary?.["@type"] || null;
-
-  return { primary, primaryIndex, primaryType };
-}
-
-// ------------------------------
-// Crawl site (single capsule per page)
-// ------------------------------
-async function crawlSite(baseUrl, ctx, owner_slug, nodeId, runId, runMeta) {
+async function crawlSite({ baseUrl, ctx, nodeId, cgRunId, manifestPath }) {
   const origin = new URL(baseUrl).origin;
 
   const visited = new Set();
   const q = [{ url: normalizeUrl(baseUrl), depth: 0 }];
 
   const siteStats = {
-    runId,
     site: origin,
     pages: 0,
     capsules: 0,
     inferred: 0,
     errors: 0,
+    schemaErrors: 0,
+    rejected: 0,
+    inserted: 0,
     start: new Date().toISOString(),
     singlePageMode: SINGLE_PAGE,
+    deterministic: CG_DETERMINISTIC,
   };
 
   const allCapsulesForClassifier = [];
 
-  if (WRITE_SNAPSHOTS) {
-    await fs.ensureDir(SNAPSHOT_DIR);
-  }
+  if (WRITE_SNAPSHOTS) await fs.ensureDir(SNAPSHOT_DIR);
 
   const pageLimit = SINGLE_PAGE ? 1 : MAX_PAGES_PER_SITE;
 
@@ -247,87 +361,126 @@ async function crawlSite(baseUrl, ctx, owner_slug, nodeId, runId, runMeta) {
       const html = await page.content();
       const text = await page.evaluate(() => document.body?.innerText || "");
 
+      // Extract asserted JSON-LD
       const jsonld = extractJsonLd(html, url, { capturedAt: harvestedAt });
+      const rawCount = Number(jsonld?.rawCount || 0);
+      const blocksRaw = Array.isArray(jsonld?.blocks) ? jsonld.blocks : [];
+      const parseErrors = Array.isArray(jsonld?.parseErrors) ? jsonld.parseErrors : [];
+      const found = Boolean(jsonld?.found);
 
-      if (jsonld.rawCount > 0 && !jsonld.found) {
-        console.warn(
-          `⚠️ JSON-LD scripts present but unparsable on ${url}:`,
-          jsonld.parseErrors
-        );
+      if (rawCount > 0 && !found) {
+        console.warn(`⚠️ JSON-LD scripts present but unparsable on ${url}:`, parseErrors);
       }
 
-      // ✅ Normalize asserted blocks to array of JSON objects
-      const assertedJsonLdArray = jsonld.found
-        ? jsonld.blocks
-            .map((b) => (b && typeof b.json === "object" ? b.json : null))
-            .filter(Boolean)
-        : [];
+      // Build single asserted-array
+      let assertedJson = null;
+      let assertedProvenance = null;
+      let assertedPrimaryIndex = null;
+      let assertedPrimaryType = null;
 
-      const assertedProvenanceArray = jsonld.found
-        ? jsonld.blocks.map((b) => b.provenance || null).filter(Boolean)
-        : [];
+      if (found && blocksRaw.length > 0) {
+        const blocks = blocksRaw.map((b) => {
+          if (b && typeof b === "object" && "json" in b) return b;
+          return { json: b, provenance: { evidenceType: "jsonld-script", url, capturedAt: harvestedAt } };
+        });
 
-      const pick = pickBestAssertedWithIndex(assertedJsonLdArray);
+        const cleanedBlocks = blocks.map((b) => ({
+          json: CG_DETERMINISTIC ? stableSortJsonLd(b.json) : b.json,
+          provenance: b.provenance || null,
+        }));
 
-      // ✅ IMPORTANT: never pass null into inferencer
-      const extractedCapsule =
-        pick.primary && typeof pick.primary === "object" ? pick.primary : {};
+        assertedJson = cleanedBlocks.map((b) => b.json);
+        assertedProvenance = {
+          evidenceType: "jsonld-script",
+          url,
+          capturedAt: harvestedAt,
+        };
 
-      const { capsule: enrichedContent, inferred } = await inferCapsule({
-        url,
-        html,
-        text,
-        extractedCapsule,
-        options: { enableLLM: ENABLE_LLM },
-      });
+        const primary = selectPrimaryIndexDeterministic(cleanedBlocks);
+        assertedPrimaryIndex = primary.index;
+        assertedPrimaryType = primary.type;
+      }
 
+      const primaryAssertedObject =
+        Array.isArray(assertedJson) && assertedJson.length > 0
+          ? assertedJson[assertedPrimaryIndex ?? 0] || assertedJson[0]
+          : {};
+
+      // Inference
+      let enrichedContent;
+      let inferredMeta;
+
+      try {
+        const out = await inferCapsule({
+          url,
+          html,
+          text,
+          extractedCapsule:
+            primaryAssertedObject && typeof primaryAssertedObject === "object" ? primaryAssertedObject : {},
+          options: { enableLLM: EFFECTIVE_ENABLE_LLM },
+        });
+        enrichedContent = out.capsule;
+        inferredMeta = out.inferred;
+      } catch (infErr) {
+        console.warn(`⚠️ Inference failed on ${url}: ${infErr.message}`);
+        siteStats.errors += 1;
+
+        enrichedContent = {
+          "@context": "https://agentnet.ai/context",
+          "@type": "agentnet:Thing",
+          "agentnet:name": (html.match(/<title[^>]*>([^<]+)<\/title>/i) || [])[1] || "Unknown",
+          "agentnet:inferred": {
+            "agentnet:name": { confidence: 0.4, source: "heuristic", method: "title-fallback" },
+          },
+        };
+        inferredMeta = enrichedContent["agentnet:inferred"] || {};
+      }
+
+      // Envelope
       const envelope = buildEnvelope({
         url,
         harvestedAt,
-        assertedJsonLdArray: assertedJsonLdArray.length
-          ? assertedJsonLdArray
-          : null,
-        assertedProvenanceArray: assertedProvenanceArray.length
-          ? assertedProvenanceArray
-          : null,
-        jsonldRawScriptCount: jsonld.rawCount,
-        jsonldParseErrors: jsonld.parseErrors.length,
+        cgRunId,
+        manifestPath,
+        assertedJsonLd: assertedJson,
+        assertedProvenance,
+        jsonldRawScriptCount: rawCount,
+        jsonldParseErrors: parseErrors.length,
         enrichedContent,
-        inferredMeta: inferred,
-        structuredMarkup: jsonld.found ? "jsonld" : "none",
-        assertedPrimaryIndex: pick.primaryIndex,
-        assertedPrimaryType: pick.primaryType,
-        runId,
+        inferredMeta,
+        structuredMarkup: found ? "jsonld" : "none",
+        assertedPrimaryIndex,
+        assertedPrimaryType,
       });
 
-      const fingerprint = fp(envelope);
-      await insertCapsule(nodeId, envelope, fingerprint, harvestedAt, "ok");
+      // price guardrail
+      guardTinyPrice(envelope["agentnet:content"], envelope["agentnet:report"]);
 
-      allCapsulesForClassifier.push({
-        "agentnet:content": envelope["agentnet:content"],
-      });
+      // Deterministic fingerprint
+      const fingerprint = fp(CG_DETERMINISTIC ? stableFingerprintView(envelope) : envelope);
 
-      if (inferred && Object.keys(inferred).length) {
-        siteStats.inferred += 1;
+      // Schema validation gate
+      let status = "ok";
+      if (validateEnvelope) {
+        const valid = validateEnvelope(envelope);
+        if (!valid) {
+          status = "needs_review";
+          envelope["agentnet:report"].schemaErrors = validateEnvelope.errors || [];
+          siteStats.schemaErrors += (validateEnvelope.errors || []).length;
+        }
       }
 
-      siteStats.pages += 1;
-      siteStats.capsules += 1;
+      await insertCapsule(nodeId, envelope, fingerprint, harvestedAt, status);
 
-      // Add to run manifest capsule list
-      runMeta.capsules.push({
-        url,
-        harvestedAt,
-        fingerprint,
-        insertedStatus: "ok",
-        asserted: {
-          structuredMarkup: jsonld.found ? "jsonld" : "none",
-          rawScriptCount: jsonld.rawCount,
-          parsedObjectCount: assertedJsonLdArray.length,
-          primaryIndex: pick.primaryIndex,
-          primaryType: pick.primaryType,
-        },
-      });
+      siteStats.capsules += 1;
+      siteStats.pages += 1;
+
+      if (status === "ok") siteStats.inserted += 1;
+      else siteStats.rejected += 1;
+
+      if (inferredMeta && Object.keys(inferredMeta).length) siteStats.inferred += 1;
+
+      allCapsulesForClassifier.push({ "agentnet:content": envelope["agentnet:content"] });
 
       if (WRITE_SNAPSHOTS) {
         const name = snapshotName(url);
@@ -335,16 +488,12 @@ async function crawlSite(baseUrl, ctx, owner_slug, nodeId, runId, runMeta) {
       }
 
       console.log(
-        `✅ 1 capsule processed for ${url} ` +
-          `(JSON-LD scripts: ${jsonld.rawCount}, parsed objects: ${assertedJsonLdArray.length})`
+        `✅ 1 capsule processed for ${url} (JSON-LD scripts: ${rawCount}, parsed objects: ${blocksRaw.length})`
       );
 
-      // Link discovery disabled in SINGLE_PAGE
+      // Discover same-origin links (disabled in SINGLE_PAGE mode)
       if (!SINGLE_PAGE && depth < MAX_DEPTH) {
-        const links = await page.$$eval("a[href]", (as) =>
-          as.map((a) => a.href).filter(Boolean)
-        );
-
+        const links = await page.$$eval("a[href]", (as) => as.map((a) => a.href).filter(Boolean));
         for (const link of links) {
           let normLink;
           try {
@@ -352,44 +501,31 @@ async function crawlSite(baseUrl, ctx, owner_slug, nodeId, runId, runMeta) {
           } catch {
             continue;
           }
-
           try {
             if (new URL(normLink).origin !== origin) continue;
           } catch {
             continue;
           }
-
-          if (!visited.has(normLink)) {
-            q.push({ url: normLink, depth: depth + 1 });
-          }
+          if (!visited.has(normLink)) q.push({ url: normLink, depth: depth + 1 });
         }
       }
     } catch (e) {
       console.error(`❌ Error crawling ${url}: ${e.message}`);
       siteStats.errors += 1;
-
-      runMeta.errors.push({
-        url,
-        message: e.message,
-        time: new Date().toISOString(),
-      });
     } finally {
       await page.close();
     }
   }
 
-  // Classify node type after crawl
+  // Classify node type
   try {
     const category = classifyNodeType(allCapsulesForClassifier);
-    await pool.query(`UPDATE nodes SET node_category=? WHERE id=?`, [
-      category,
-      nodeId,
-    ]);
+    await pool.query(`UPDATE nodes SET node_category=? WHERE id=?`, [category, nodeId]);
     console.log(`🏷️  Node ${origin} classified as '${category}'`);
-    runMeta.node.nodeCategory = category;
+    siteStats.nodeCategory = category;
   } catch (err) {
     console.warn(`⚠️ Node classification failed for ${origin}: ${err.message}`);
-    runMeta.node.nodeCategory = null;
+    siteStats.nodeCategory = null;
   }
 
   siteStats.end = new Date().toISOString();
@@ -400,7 +536,41 @@ async function crawlSite(baseUrl, ctx, owner_slug, nodeId, runId, runMeta) {
 }
 
 // ------------------------------
-// Worker
+// Run manifest writer (Audit Receipt)
+// ------------------------------
+async function writeRunManifest({ runId, startedAt, finishedAt, seed, settings, node, summary, capsules, errors }) {
+  await fs.ensureDir(RUNS_DIR);
+  const manifestPath = `${RUNS_DIR}/${runId}.json`;
+
+  const manifest = {
+    runId,
+    startedAt,
+    finishedAt,
+    cgVersion: CG_VERSION,
+    queueName,
+    seed,
+    settings,
+    node,
+    summary,
+    capsules,
+    errors: errors || [],
+    manifestPath,
+    nodeCategory: node?.nodeCategory || null,
+
+    // ✅ CG Output Contract
+    "agentnet:cgOutput": {
+      capsulesInserted: summary?.inserted ?? 0,
+      capsulesRejected: summary?.rejected ?? 0,
+      schemaErrorsCount: summary?.schemaErrors ?? 0,
+    },
+  };
+
+  await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+  return manifestPath;
+}
+
+// ------------------------------
+// BullMQ Worker
 // ------------------------------
 new Worker(
   queueName,
@@ -408,96 +578,89 @@ new Worker(
     const { url, owner_slug } = job.data;
 
     const runId = makeRunId();
-    const runStartedAt = new Date().toISOString();
-
-    const manifestPath = runManifestPathFor(runId);
-
-    // Run manifest object
-    const runMeta = {
-      runId,
-      startedAt: runStartedAt,
-      finishedAt: null,
-      cgVersion: CG_VERSION,
-      queueName,
-      seed: {
-        owner_slug,
-        url,
-      },
-      settings: {
-        SINGLE_PAGE,
-        MAX_DEPTH,
-        MAX_PAGES_PER_SITE,
-        PER_HOST_DELAY,
-        ENABLE_LLM,
-        WRITE_SNAPSHOTS,
-        USER_AGENT: UA,
-        CONCURRENCY,
-      },
-      node: {
-        nodeId: null,
-        nodeCategory: null,
-      },
-      summary: {
-        pages: 0,
-        capsules: 0,
-        inferred: 0,
-        errors: 0,
-      },
-      capsules: [],
-      errors: [],
-      manifestPath, // ✅ now always populated in-file
-    };
+    const startedAt = new Date().toISOString();
 
     const browser = await chromium.launch({ headless: true });
     const ctx = await browser.newContext({ userAgent: UA });
 
+    const settings = {
+      SINGLE_PAGE,
+      MAX_DEPTH,
+      MAX_PAGES_PER_SITE,
+      PER_HOST_DELAY,
+      ENABLE_LLM,
+      EFFECTIVE_ENABLE_LLM,
+      CG_DETERMINISTIC,
+      VALIDATE_ENVELOPE: Boolean(validateEnvelope),
+      SCHEMA_LOADED: envelopeSchemaLoaded,
+      WRITE_SNAPSHOTS,
+      USER_AGENT: UA,
+      CONCURRENCY,
+    };
+
+    const seed = { owner_slug, url };
+    const capsuleReceipts = [];
+    const errors = [];
+
     try {
       const nodeId = await upsertNode(owner_slug, url);
-      runMeta.node.nodeId = nodeId;
 
-      const stats = await crawlSite(url, ctx, owner_slug, nodeId, runId, runMeta);
+      // Capsules will write this into the envelope immediately
+      const manifestPath = `${RUNS_DIR}/${runId}.json`;
+
+      const stats = await crawlSite({
+        baseUrl: url,
+        ctx,
+        nodeId,
+        cgRunId: runId,
+        manifestPath,
+      });
 
       await browser.close();
 
-      runMeta.finishedAt = new Date().toISOString();
-      runMeta.summary.pages = stats.pages;
-      runMeta.summary.capsules = stats.capsules;
-      runMeta.summary.inferred = stats.inferred;
-      runMeta.summary.errors = stats.errors;
+      capsuleReceipts.push({
+        url,
+        finishedAt: stats.end || new Date().toISOString(),
+        insertedStatus: "see-db",
+      });
 
-      await writeRunManifestAt(manifestPath, runMeta);
+      const finishedAt = new Date().toISOString();
 
-      console.log(
-        `🏁 ${stats.pages} pages / ${stats.capsules} capsules (${stats.inferred} inferred) for ${url}`
-      );
-      console.log(`🧾 Run manifest written: ${manifestPath}`);
+      const summary = {
+        pages: stats.pages,
+        capsules: stats.capsules,
+        inferred: stats.inferred,
+        errors: stats.errors,
+        inserted: stats.inserted,
+        rejected: stats.rejected,
+        schemaErrors: stats.schemaErrors,
+      };
 
-      return { ok: true, runId, manifestPath };
+      const node = { nodeId, nodeCategory: stats.nodeCategory || null };
+
+      const written = await writeRunManifest({
+        runId,
+        startedAt,
+        finishedAt,
+        seed,
+        settings,
+        node,
+        summary,
+        capsules: capsuleReceipts,
+        errors,
+      });
+
+      console.log(`🏁 ${stats.pages} pages / ${stats.capsules} capsules (${stats.inferred} inferred) for ${url}`);
+      console.log(`🧾 Run manifest written: ${written}`);
+
+      return { ok: true, runId, manifestPath: written };
     } catch (e) {
       await browser.close();
-
-      runMeta.finishedAt = new Date().toISOString();
-      runMeta.errors.push({
-        url,
-        message: e.message,
-        time: new Date().toISOString(),
-        fatal: true,
-      });
-
-      try {
-        await writeRunManifestAt(manifestPath, runMeta);
-        console.log(`🧾 Run manifest written (fatal): ${manifestPath}`);
-      } catch (writeErr) {
-        console.warn(`⚠️ Failed to write run manifest: ${writeErr.message}`);
-      }
-
       console.error(`💥 Fatal error on ${url}: ${e.message}`);
-      await appendLog({
-        runId,
-        site: url,
-        error: e.message,
-        time: new Date().toISOString(),
-      });
+
+      errors.push({ site: url, error: e.message, time: new Date().toISOString() });
+
+      await appendLog({ site: url, error: e.message, time: new Date().toISOString() });
 
       throw e;
     }

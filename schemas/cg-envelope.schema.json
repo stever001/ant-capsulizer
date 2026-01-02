@@ -1,0 +1,102 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://agentnet.ai/schemas/cg-envelope.schema.json",
+  "title": "AgentNet CG Capsule Envelope",
+  "type": "object",
+  "required": [
+    "@context",
+    "@type",
+    "agentnet:cgVersion",
+    "agentnet:cgRunId",
+    "agentnet:source",
+    "agentnet:captureDate",
+    "agentnet:content",
+    "agentnet:report"
+  ],
+  "properties": {
+    "@context": {
+      "type": "string",
+      "const": "https://agentnet.ai/context"
+    },
+    "@type": {
+      "type": "string",
+      "const": "agentnet:Capsule"
+    },
+
+    "agentnet:cgVersion": {
+      "type": "string",
+      "minLength": 1
+    },
+
+    "agentnet:cgRunId": {
+      "type": "string",
+      "minLength": 1
+    },
+
+    "agentnet:source": {
+      "type": "string",
+      "format": "uri"
+    },
+
+    "agentnet:captureDate": {
+      "type": "string",
+      "format": "date-time"
+    },
+
+    "agentnet:asserted": {
+      "type": ["object", "null"],
+      "properties": {
+        "json": {
+          "type": ["object", "array", "null"]
+        },
+        "provenance": {
+          "type": ["object", "null"]
+        }
+      },
+      "additionalProperties": true
+    },
+
+    "agentnet:content": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": true
+    },
+
+    "agentnet:inferred": {
+      "type": "object",
+      "additionalProperties": true
+    },
+
+    "agentnet:report": {
+      "type": "object",
+      "required": ["structuredMarkup"],
+      "properties": {
+        "structuredMarkup": {
+          "type": "string",
+          "enum": ["jsonld", "none"]
+        },
+        "jsonldRawScriptCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "jsonldParseErrors": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "assertedPrimaryIndex": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "assertedPrimaryType": {
+          "type": ["string", "null"]
+        },
+        "singlePageMode": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+
+  "additionalProperties": true
+}
