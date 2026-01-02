@@ -1,0 +1,48 @@
+{
+  "runId": "run_2026-01-02T19-09-19-590Z__1bfbe8c44eca",
+  "startedAt": "2026-01-02T19:09:19.590Z",
+  "finishedAt": "2026-01-02T19:09:20.717Z",
+  "cgVersion": "cg-0.4-manifestpath",
+  "queueName": "capsuleQueue",
+  "seed": {
+    "owner_slug": "demo-brochure",
+    "url": "https://example.com"
+  },
+  "settings": {
+    "SINGLE_PAGE": true,
+    "MAX_DEPTH": 10,
+    "MAX_PAGES_PER_SITE": 10,
+    "PER_HOST_DELAY": 500,
+    "ENABLE_LLM": true,
+    "WRITE_SNAPSHOTS": true,
+    "USER_AGENT": "AgentNet-Capsulizer/1.0 (+https://agentnet.ai)",
+    "CONCURRENCY": 6
+  },
+  "node": {
+    "nodeId": 1938,
+    "nodeCategory": "landing"
+  },
+  "summary": {
+    "pages": 1,
+    "capsules": 1,
+    "inferred": 1,
+    "errors": 0
+  },
+  "capsules": [
+    {
+      "url": "https://example.com/",
+      "harvestedAt": "2026-01-02T19:09:20.680Z",
+      "fingerprint": "sha256:51b0781cf4eddf5b30c70cb435963cf33570c329a6d3a04e3742d72b2987f5be",
+      "insertedStatus": "ok",
+      "asserted": {
+        "structuredMarkup": "none",
+        "rawScriptCount": 0,
+        "parsedObjectCount": 0,
+        "primaryIndex": null,
+        "primaryType": null
+      }
+    }
+  ],
+  "errors": [],
+  "manifestPath": "runs/run_2026-01-02T19-09-19-590Z__1bfbe8c44eca.json"
+}

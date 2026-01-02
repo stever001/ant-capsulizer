@@ -1,0 +1,48 @@
+{
+  "runId": "run_2026-01-02T18-59-02-582Z__02215b2f5cc8",
+  "startedAt": "2026-01-02T18:59:02.583Z",
+  "finishedAt": "2026-01-02T18:59:04.879Z",
+  "cgVersion": "cg-0.4-manifestpath",
+  "queueName": "capsuleQueue",
+  "seed": {
+    "owner_slug": "demo-structured",
+    "url": "https://www.allbirds.com/products/mens-wool-runners"
+  },
+  "settings": {
+    "SINGLE_PAGE": true,
+    "MAX_DEPTH": 10,
+    "MAX_PAGES_PER_SITE": 10,
+    "PER_HOST_DELAY": 500,
+    "ENABLE_LLM": true,
+    "WRITE_SNAPSHOTS": true,
+    "USER_AGENT": "AgentNet-Capsulizer/1.0 (+https://agentnet.ai)",
+    "CONCURRENCY": 6
+  },
+  "node": {
+    "nodeId": 1931,
+    "nodeCategory": "ecommerce"
+  },
+  "summary": {
+    "pages": 1,
+    "capsules": 1,
+    "inferred": 1,
+    "errors": 0
+  },
+  "capsules": [
+    {
+      "url": "https://www.allbirds.com/products/mens-wool-runners",
+      "harvestedAt": "2026-01-02T18:59:04.732Z",
+      "fingerprint": "sha256:cad1d3106050fdf7b8894da4e7fac7e001f8ab7bd29d64c7b66e510b823ba98f",
+      "insertedStatus": "ok",
+      "asserted": {
+        "structuredMarkup": "jsonld",
+        "rawScriptCount": 4,
+        "parsedObjectCount": 4,
+        "primaryIndex": 0,
+        "primaryType": "Product"
+      }
+    }
+  ],
+  "errors": [],
+  "manifestPath": "runs/run_2026-01-02T18-59-02-582Z__02215b2f5cc8.json"
+}

@@ -8,6 +8,15 @@
  * - Heuristics-first; optional LLM enrichment if OPENAI_API_KEY + options.model present
  * - Produces provenance via agentnet:inferred with {confidence, source, method}
  * - Never overwrites explicit source metadata unless configured to do so
+ *
+ * HARDENING UPDATE:
+ * - extractedCapsule may be null/undefined/non-object; we normalize it.
+ * - never read extractedCapsule["@type"] unless it is a valid object.
+ *
+ * PRICE GUARDRAIL UPDATE:
+ * - Only infer price when:
+ *   (A) asserted JSON-LD says Product, OR
+ *   (B) heuristics say Product AND the page has strong commerce intent signals.
  */
 
 const DEFAULT_CONTEXT = "https://agentnet.ai/context";
@@ -26,29 +35,16 @@ function normText(s) {
     .trim();
 }
 
-function pickFirst(...vals) {
-  for (const v of vals) {
-    if (v === 0 || (typeof v === "string" && v.trim().length) || (v && typeof v !== "undefined"))
-      return v;
-  }
-  return undefined;
-}
-
 function toUSDLikeCurrency(sym) {
   if (!sym) return undefined;
   const map = { "$": "USD", "€": "EUR", "£": "GBP", "¥": "JPY", "C$": "CAD", "A$": "AUD" };
   return map[sym] || undefined;
 }
 
-function toConfidence(score, maxScore) {
-  if (!maxScore) return 0.5;
-  return clamp(score / maxScore);
-}
-
 function addProvenance(target, key, confidence, source, method) {
   target["agentnet:inferred"] ||= {};
   target["agentnet:inferred"][key] = {
-    confidence: Number(confidence.toFixed(2)),
+    confidence: Number(clamp(confidence).toFixed(2)),
     source,
     method,
   };
@@ -60,6 +56,10 @@ function jsonParseSafe(s, fallback = null) {
   } catch {
     return fallback;
   }
+}
+
+function asObject(x) {
+  return x && typeof x === "object" && !Array.isArray(x) ? x : {};
 }
 
 // --------------------------
@@ -77,8 +77,28 @@ function indicatorScore(text, indicators) {
 }
 
 function detectType({ text, html }) {
-  const productIndicators = ["add to cart", "buy now", "sku", "specifications", "in stock", "price", "was", "sale"];
-  const orgIndicators = ["about us", "our team", "contact us", "headquarters", "mission", "careers", "phone", "address"];
+  const productIndicators = [
+    "add to cart",
+    "buy now",
+    "sku",
+    "specifications",
+    "in stock",
+    "price",
+    "was",
+    "sale",
+    "checkout",
+  ];
+  const orgIndicators = [
+    "about us",
+    "our team",
+    "contact us",
+    "headquarters",
+    "mission",
+    "careers",
+    "phone",
+    "address",
+    "hours",
+  ];
   const articleIndicators = ["by ", "author", "published", "updated", "read more", "minutes read", "newsletter"];
 
   const prodScore = indicatorScore(text, productIndicators);
@@ -92,40 +112,85 @@ function detectType({ text, html }) {
   if (max === artScore && max > prodScore && max > orgScore) type = "agentnet:Article";
 
   const confidence = clamp(max / Math.max(6, prodScore + orgScore + artScore || 1));
-  return { type, confidence };
+  return { type, confidence, scores: { prodScore, orgScore, artScore } };
+}
+
+// --------------------------
+// Commerce-intent gate (for price inference)
+// --------------------------
+function hasStrongCommerceIntent(text) {
+  // Require at least 2 distinct strong commerce tokens.
+  const strong = [
+    "add to cart",
+    "checkout",
+    "buy now",
+    "shop now",
+    "order now",
+    "shipping",
+    "returns",
+    "size",
+    "color",
+    "quantity",
+    "in stock",
+    "out of stock",
+    "variants",
+    "select size",
+    "select color",
+  ];
+
+  const t = text.toLowerCase();
+  let hits = 0;
+  for (const token of strong) {
+    if (t.includes(token)) hits += 1;
+    if (hits >= 2) return true;
+  }
+  return false;
 }
 
 // --------------------------
 // Field extractors (heuristics)
 // --------------------------
 function extractPrice(text) {
-  // $79.00, 79.00 USD, USD 79, €59, £39.99, etc.
-  const priceRe = /(?:USD\s*)?([$€£]|C\$|A\$)?\s?(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)(?:\s?(USD|EUR|GBP|JPY|CAD|AUD))?/i;
+  /**
+   * Hardened to reduce false positives:
+   * - Requires either a currency symbol OR a currency code.
+   */
+  const priceRe =
+    /(?:USD|EUR|GBP|JPY|CAD|AUD)?\s*([$€£¥]|C\$|A\$)\s?(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)\b|(?:\b(USD|EUR|GBP|JPY|CAD|AUD)\b)\s?(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)\b/i;
+
   const m = text.match(priceRe);
   if (!m) return null;
-  let [, sym, amountRaw, code] = m;
+
+  const sym = m[1] || null;
+  const amountRaw1 = m[2] || null;
+  const code = m[3] || null;
+  const amountRaw2 = m[4] || null;
+
+  const amountRaw = amountRaw1 || amountRaw2;
+  if (!amountRaw) return null;
+
   const amount = Number(amountRaw.replace(/[.,](?=\d{3}\b)/g, "").replace(",", "."));
+  if (!Number.isFinite(amount)) return null;
+
   const priceCurrency = code || toUSDLikeCurrency(sym);
+  if (!priceCurrency) return null;
+
   return { price: amount.toFixed(2), priceCurrency };
 }
 
 function extractSKU(text) {
-  // e.g. SKU: ABC-1234 or Part No. 123-456
   const re = /\b(?:SKU|Part\s*(?:No\.?|Number))[:#]?\s*([A-Z0-9\-_/]{3,})\b/i;
   const m = text.match(re);
   return m ? m[1] : null;
 }
 
 function extractBrand(text, html) {
-  // Look for "Brand: Name" or common boilerplate
   const brandLine = text.match(/\bBrand[:]\s*([A-Za-z0-9&\-\s]{2,60})\b/);
   if (brandLine) return safeTrim(brandLine[1]);
 
-  // Meta tags as fallback
   const metaBrand = html.match(/<meta[^>]+itemprop=["']?brand["']?[^>]*content=["']([^"']+)["']/i);
   if (metaBrand) return safeTrim(metaBrand[1]);
 
-  // Title fallback like "Name | Brand"
   const titleBrand = html.match(/<title[^>]*>([^<]+)<\/title>/i);
   if (titleBrand && /\|/.test(titleBrand[1])) {
     const parts = titleBrand[1].split("|").map((s) => s.trim());
@@ -135,13 +200,14 @@ function extractBrand(text, html) {
 }
 
 function extractContacts(text) {
-  const emails = uniq((text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || []).map((e) => e.toLowerCase()));
+  const emails = uniq(
+    (text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || []).map((e) => e.toLowerCase())
+  );
   const phones = uniq(text.match(/(?:\+?\d{1,3}[\s.-]?)?(?:\(\d{3}\)|\d{3})[\s.-]?\d{3}[\s.-]?\d{4}/g) || []);
   return { emails, phones };
 }
 
 function extractAddress(text) {
-  // Very rough US-like address lines (improve as needed)
   const addrRe = /\b(\d{1,6}\s+[A-Za-z0-9.\- ]+)\s*,?\s*([A-Za-z.\- ]+),\s*([A-Z]{2})\s*(\d{5}(?:-\d{4})?)\b/;
   const m = text.match(addrRe);
   if (!m) return null;
@@ -150,10 +216,15 @@ function extractAddress(text) {
 }
 
 function extractPublishDates(text, html) {
-  // Look for "Published" or <meta> tags
-  const pubLine = text.match(/\b(Published|Posted|Updated)\s*[:\-]?\s*(\w{3,}\s+\d{1,2},\s+\d{4}|\d{4}\-\d{2}\-\d{2})\b/i);
-  const metaPub = html.match(/<meta[^>]+(?:property|name)=["'](?:article:published_time|pubdate|datePublished)["'][^>]*content=["']([^"']+)["']/i);
-  const metaUpd = html.match(/<meta[^>]+(?:property|name)=["'](?:article:modified_time|updated|dateModified)["'][^>]*content=["']([^"']+)["']/i);
+  const pubLine = text.match(
+    /\b(Published|Posted|Updated)\s*[:\-]?\s*(\w{3,}\s+\d{1,2},\s+\d{4}|\d{4}\-\d{2}\-\d{2})\b/i
+  );
+  const metaPub = html.match(
+    /<meta[^>]+(?:property|name)=["'](?:article:published_time|pubdate|datePublished)["'][^>]*content=["']([^"']+)["']/i
+  );
+  const metaUpd = html.match(
+    /<meta[^>]+(?:property|name)=["'](?:article:modified_time|updated|dateModified)["'][^>]*content=["']([^"']+)["']/i
+  );
   return {
     datePublished: pubLine ? pubLine[2] : metaPub ? metaPub[1] : undefined,
     dateModified: metaUpd ? metaUpd[1] : undefined,
@@ -166,6 +237,10 @@ function extractPublishDates(text, html) {
 async function callLLMEnrichment({ url, html, text, seedCapsule, model, temperature = 0, maxTokens = 800 }) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey || !model) return null;
+
+  if (typeof fetch !== "function") {
+    throw new Error("Global fetch() not available. Use Node 18+ or polyfill fetch.");
+  }
 
   const prompt = [
     "You are transforming a web page into a JSON-LD AgentNet capsule.",
@@ -187,7 +262,7 @@ async function callLLMEnrichment({ url, html, text, seedCapsule, model, temperat
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${apiKey}`,
+      Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
@@ -195,7 +270,10 @@ async function callLLMEnrichment({ url, html, text, seedCapsule, model, temperat
       temperature,
       max_tokens: maxTokens,
       messages: [
-        { role: "system", content: "You convert webpages to AgentNet JSON-LD capsules with conservative, well-structured outputs." },
+        {
+          role: "system",
+          content: "You convert webpages to AgentNet JSON-LD capsules with conservative, well-structured outputs.",
+        },
         { role: "user", content: prompt },
         { role: "user", content: `Visible Text (first 6000 chars):\n${text.slice(0, 6000)}` },
         { role: "user", content: `HTML (first 6000 chars):\n${html.slice(0, 6000)}` },
@@ -218,52 +296,42 @@ async function callLLMEnrichment({ url, html, text, seedCapsule, model, temperat
 // Merge policy
 // --------------------------
 function mergeCapsules(original = {}, inferred = {}, { overwriteExplicit = false } = {}) {
-  const out = JSON.parse(JSON.stringify(original || {}));
-  const prov = out["agentnet:inferred"] || {};
-  const inf = inferred || {};
+  const orig = asObject(original);
+  const inf = asObject(inferred);
 
-  // Never drop @context/@type from original if present
+  const out = JSON.parse(JSON.stringify(orig));
+  const prov = out["agentnet:inferred"] || {};
+
   out["@context"] = out["@context"] || inf["@context"] || DEFAULT_CONTEXT;
   out["@type"] = out["@type"] || inf["@type"] || "agentnet:Thing";
 
   for (const [k, v] of Object.entries(inf)) {
     if (k === "@context" || k === "@type" || k === "agentnet:inferred") continue;
-    const hasExplicit = Object.prototype.hasOwnProperty.call(original || {}, k);
+
+    const hasExplicit = Object.prototype.hasOwnProperty.call(orig, k);
     const isEmptyExplicit =
-      typeof original[k] === "undefined" ||
-      (typeof original[k] === "string" && !original[k].trim());
+      typeof orig[k] === "undefined" || (typeof orig[k] === "string" && !orig[k].trim());
 
     if (!hasExplicit || isEmptyExplicit || overwriteExplicit) {
       out[k] = v;
     }
   }
 
-  // Merge provenance
   if (inf["agentnet:inferred"]) {
     out["agentnet:inferred"] = { ...prov, ...inf["agentnet:inferred"] };
   } else if (Object.keys(prov).length) {
     out["agentnet:inferred"] = prov;
   }
+
   return out;
 }
 
 // --------------------------
 // Main inference function
 // --------------------------
-/**
- * inferCapsule
- * @param {Object} args
- * @param {string} args.url
- * @param {string} args.html
- * @param {string} args.text - visible text
- * @param {Object} args.extractedCapsule - capsule built from on-page metadata (if any)
- * @param {Object} args.options
- *  - model?: string (OpenAI model for enrichment)
- *  - overwriteExplicit?: boolean (default false)
- *  - enableLLM?: boolean (default true)
- * @returns {Promise<{ capsule: Object, inferred: Object, typeGuess: {type, confidence} }>}
- */
 async function inferCapsule({ url, html = "", text = "", extractedCapsule = {}, options = {} }) {
+  const extracted = asObject(extractedCapsule);
+
   const opts = {
     enableLLM: true,
     overwriteExplicit: false,
@@ -274,28 +342,41 @@ async function inferCapsule({ url, html = "", text = "", extractedCapsule = {}, 
   const t = normText(text);
   const typeGuess = detectType({ text: t, html });
 
-  // Seed capsule
   const inferred = {
     "@context": DEFAULT_CONTEXT,
-    "@type": extractedCapsule["@type"] || typeGuess.type || "agentnet:Thing",
+    "@type": extracted["@type"] || typeGuess.type || "agentnet:Thing",
   };
 
-  // Type confidence provenance if we inferred it
-  if (!extractedCapsule["@type"] && typeGuess.type !== "agentnet:Thing") {
+  if (!extracted["@type"] && typeGuess.type !== "agentnet:Thing") {
     addProvenance(inferred, "@type", clamp(0.65 + 0.3 * typeGuess.confidence), "heuristic", "type-detection");
   }
 
+  // --------------------------
+  // PRICE GUARDRAIL:
+  // Only infer price if:
+  //  A) asserted type looks like a Product, OR
+  //  B) we guessed Product AND page shows strong commerce intent.
+  // --------------------------
+  const assertedType = typeof extracted["@type"] === "string" ? extracted["@type"] : "";
+  const assertedLooksProduct = /Product/i.test(assertedType);
+  const guessedProduct = inferred["@type"] === "agentnet:Product";
+
+  const allowPriceInference = assertedLooksProduct || (guessedProduct && hasStrongCommerceIntent(t));
+
   // Product-like fields
-  if (inferred["@type"] === "agentnet:Product" || /product/i.test(t)) {
-    const p = extractPrice(t);
-    if (p?.price) {
-      inferred["agentnet:price"] = p.price;
-      addProvenance(inferred, "agentnet:price", 0.8, "heuristic", "price-regex");
+  if (guessedProduct || /product/i.test(t)) {
+    if (allowPriceInference) {
+      const p = extractPrice(t);
+      if (p?.price) {
+        inferred["agentnet:price"] = p.price;
+        addProvenance(inferred, "agentnet:price", 0.8, "heuristic", "price-regex");
+      }
+      if (p?.priceCurrency) {
+        inferred["agentnet:priceCurrency"] = p.priceCurrency;
+        addProvenance(inferred, "agentnet:priceCurrency", 0.7, "heuristic", "currency-map");
+      }
     }
-    if (p?.priceCurrency) {
-      inferred["agentnet:priceCurrency"] = p.priceCurrency;
-      addProvenance(inferred, "agentnet:priceCurrency", 0.7, "heuristic", "currency-map");
-    }
+
     const sku = extractSKU(t);
     if (sku) {
       inferred["agentnet:sku"] = sku;
@@ -337,7 +418,6 @@ async function inferCapsule({ url, html = "", text = "", extractedCapsule = {}, 
       inferred["agentnet:dateModified"] = dates.dateModified;
       addProvenance(inferred, "agentnet:dateModified", 0.7, "heuristic", "date-meta");
     }
-    // Try author byline
     const byline = t.match(/\bby\s+([A-Z][A-Za-z.\- ]{1,60})\b/);
     if (byline) {
       inferred["agentnet:author"] = safeTrim(byline[1]);
@@ -345,15 +425,15 @@ async function inferCapsule({ url, html = "", text = "", extractedCapsule = {}, 
     }
   }
 
-  // Try a generic name/description
-  if (!extractedCapsule["agentnet:name"]) {
+  // Generic name/description
+  if (!extracted["agentnet:name"]) {
     const title = (html.match(/<title[^>]*>([^<]+)<\/title>/i) || [])[1];
     if (title) {
       inferred["agentnet:name"] = safeTrim(title.replace(/\s*\|\s*[^|]+$/, ""));
       addProvenance(inferred, "agentnet:name", 0.6, "heuristic", "title-fallback");
     }
   }
-  if (!extractedCapsule["agentnet:description"]) {
+  if (!extracted["agentnet:description"]) {
     const metaDesc = (html.match(/<meta[^>]+name=["']description["'][^>]*content=["']([^"']+)["']/i) || [])[1];
     if (metaDesc) {
       inferred["agentnet:description"] = safeTrim(metaDesc);
@@ -364,20 +444,20 @@ async function inferCapsule({ url, html = "", text = "", extractedCapsule = {}, 
   // Optional LLM enrichment phase (conservative)
   if (opts.enableLLM && opts.model && process.env.OPENAI_API_KEY) {
     try {
+      const seed = mergeCapsules(extracted, inferred);
       const llmCapsule = await callLLMEnrichment({
         url,
         html,
         text: t,
-        seedCapsule: mergeCapsules(extractedCapsule, inferred),
+        seedCapsule: seed,
         model: opts.model,
       });
 
       if (llmCapsule && typeof llmCapsule === "object") {
-        // add low-ish default confidence provenance for LLM-filled fields that we didn't already set
         const llmAugmented = {};
         for (const [k, v] of Object.entries(llmCapsule)) {
           if (k === "@context" || k === "@type" || k === "agentnet:inferred") continue;
-          if (typeof inferred[k] === "undefined" && typeof (extractedCapsule || {})[k] === "undefined") {
+          if (typeof inferred[k] === "undefined" && typeof extracted[k] === "undefined") {
             llmAugmented[k] = v;
           }
         }
@@ -388,14 +468,11 @@ async function inferCapsule({ url, html = "", text = "", extractedCapsule = {}, 
       }
     } catch (e) {
       // Non-fatal; continue with heuristics
-      // console.warn("LLM enrichment skipped:", e.message);
     }
   }
 
-  // Final merge (explicit source data wins by default)
-  const capsule = mergeCapsules(extractedCapsule, inferred, { overwriteExplicit: opts.overwriteExplicit });
+  const capsule = mergeCapsules(extracted, inferred, { overwriteExplicit: opts.overwriteExplicit });
 
-  // Ensure @context default
   if (!capsule["@context"]) capsule["@context"] = DEFAULT_CONTEXT;
 
   return { capsule, inferred, typeGuess };
@@ -406,5 +483,5 @@ async function inferCapsule({ url, html = "", text = "", extractedCapsule = {}, 
 // --------------------------
 module.exports = {
   inferCapsule,
-  mergeCapsules, // exported in case you want to reuse
+  mergeCapsules,
 };
